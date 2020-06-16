@@ -1,7 +1,7 @@
 import networkx as nx
 import numpy as np
 import geopandas as gpd
-import GOSTnet as gn
+import GOSTnets as gn
 import pandas as pd
 from shapely.geometry import LineString
 import mapclassify
@@ -758,7 +758,9 @@ def combine_networks(base, new, walk_speed = 4.5, walk_thres = 100, add_boarding
             data2['length'] = row['NN_dist']
             data2['infra_type'] = 'net_glue'
             data2['mode'] = 'net_glue (walk)'
-            data2['time'] = row['NN_dist']/(walk_speed*1000/3600) + row['boarding_c']
+            data2['boarding_c'] = row['boarding_c']
+            data2['boarding_w'] = row['NN_dist']/(walk_speed*1000/3600)
+            data2['time'] = data2['boarding_c'] + data2['boarding_w']
             if data2['length']< walk_thres:
                 edges_to_add.append((v, u, data2))
         else:
@@ -778,3 +780,73 @@ def combine_networks(base, new, walk_speed = 4.5, walk_thres = 100, add_boarding
     base_net = nx.convert_node_labels_to_integers(base_net)
     
     return base_net
+
+
+def select_trip_freq_bytime(start, end, GTFS_freq):
+    indi = np.logical_and(GTFS_freq['end_time']>=start, GTFS_freq['start_time']<=end)
+    GTFS_freq_selec = GTFS_freq[indi]
+
+    #GTFS_freq_selec['e_start_time'] =
+    GTFS_freq_selec['start_time_eff'] = np.maximum(GTFS_freq_selec['start_time'], start)
+    GTFS_freq_selec['end_time_eff'] = np.minimum(GTFS_freq_selec['end_time'], end)
+    GTFS_freq_selec['range_time_eff'] = GTFS_freq_selec['end_time_eff'] - GTFS_freq_selec['start_time_eff']
+    
+    return GTFS_freq_selec
+
+def average_trip_freq(start, end, GTFS_freq):
+    GTFS_freq_selec = select_trip_freq_bytime(start, end, GTFS_freq)
+    wtavg = lambda x: np.average(x.loc[:,'headway_secs'], weights = x.loc[:,'range_time_eff'])
+    avg_times = GTFS_freq_selec.groupby('trip_id').apply(wtavg)
+    start_time = GTFS_freq_selec.groupby('trip_id')['start_time_eff'].min()
+    end_time = GTFS_freq_selec.groupby('trip_id')['end_time_eff'].max()
+    
+    return pd.DataFrame({'avg_times': avg_times,
+                  'op_start_time': start_time,
+                  'op_end_time': end_time})
+    
+
+def prepare_network_data(GTFS, crs, start = None, end = None, bad_trips = 'point_lines', trace = False ):
+    """
+    Transforms a GTFS feed into an edge data frame and a stop point GeoDataFrame with all information needed to generate a network x transport network.
+    If start and end specified, average headways are calculated and boarding costs added to the stop point data frame
+    -----------
+    Parameters:
+    GTFS <partridge.GTFS.feed>: The respective GTFS feed
+    crs <dict>: The crs used for all calculations. Should be metric
+    start <float>: Start time in seconds after midnight
+    end <float>: End time in seconds after midnight
+    bad_trips <string>: How to handle invalid geometries? Valid options are: 'point_lines', 'points', None
+    trace <bool>: Report progress?
+    
+    Returns:
+    GTFS_edge <geopandas.GeoDataFrame>
+    GTFS_stops <geopandas.GeoDataFrame>    
+    """
+    
+    #Load edge data:
+    GTFS_edge = GTFS_to_edge_gdf(GTFS, crs , trace,  bad_trips)
+    #Add length and speed information:
+    GTFS_edge['length'] = GTFS_edge.length
+    GTFS_edge['speed'] = GTFS_edge['length']/GTFS_edge['travel_time']*3.6
+    #Load stop data
+    GTFS_stops = GTFS.stops.to_crs(crs)
+    
+    #Obtain all trips that are operative during a time and their average frequency
+    if start != None:
+        avg_trip_freq = average_trip_freq(start, end, GTFS.frequencies)
+        operative_trips = avg_trip_freq.index.values
+        
+        #Select all operative trips:
+        GTFS_edge = GTFS_edge.set_index('trip_id').loc[operative_trips,].reset_index()
+        
+        #Select operative nodes
+        operative_nodes = pd.concat([GTFS_edge.merge(avg_trip_freq, how = 'left', on ='trip_id').loc[:,['u','avg_times', 'op_start_time', 'op_end_time']],
+                             GTFS_edge.merge(avg_trip_freq, how = 'left', on ='trip_id').loc[:,['v','avg_times', 'op_start_time', 'op_end_time']].rename(columns = dict(v = 'u'))], axis = 0).groupby('u').agg({'avg_times': 'mean', 'op_start_time': 'min','op_end_time': 'max' }).reset_index()
+
+        operative_nodes = operative_nodes.rename(columns = dict(avg_times = 'boarding_c',
+                                     u = 'stop_id'))
+        
+        GTFS_stops =  gpd.GeoDataFrame(operative_nodes.merge(GTFS_stops, how = 'left', on = 'stop_id'), geometry = 'geometry', crs = crs)
+        
+    return GTFS_edge, GTFS_stops
+    
