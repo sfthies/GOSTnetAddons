@@ -3,7 +3,7 @@ import numpy as np
 import geopandas as gpd
 import GOSTnets as gn
 import pandas as pd
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point, MultiPoint
 import mapclassify
     
 def make_fishnet(gpd_df, res, reduced = True):
@@ -850,3 +850,66 @@ def prepare_network_data(GTFS, crs, start = None, end = None, bad_trips = 'point
         
     return GTFS_edge, GTFS_stops
     
+    
+def line_to_equi_points(line, inter_dist):
+    """
+    Function takes shapely line and returns a list of equi-distant points on that line
+    -------
+    Parameters:
+    line: shapely line object
+    inter_dist: interpolation distance. Make sure that the distance fits the specified crs/ projection
+    """
+    current_dist = inter_dist
+    line_length = line.length
+    ## append the starting coordinate to the list
+    list_points = []
+    list_points.append(Point(list(line.coords)[0]))
+
+    ## while the current cumulative distance is less than the total length of the line
+    while current_dist < line_length:
+        ## use interpolate and increase the current distance
+        list_points.append(line.interpolate(current_dist))
+        current_dist += inter_dist
+    
+    return list_points
+
+
+def linegdf_to_pointgdf(data, equi_dist, return_counts = True, add_line_id = False):
+    """
+    Transforms a geopandas GeoDataFrame with Spatial Line geometries to a GeoDataFrame consiting of all the points that define the lines.
+    All line attributes are replicated.
+    ------
+    Parameters:
+    data: a geopandas GeoDataFrame with spatial line geometries
+    equi_dist: a distance at which the points shall be resampled
+    return counts: if True, the returned data frame contains a column "COUNTS" specifying how many resampled point refer to the same line
+    add_line_id: if True,  the returned data frame contains a column "ID" specifying to which unique line a point belongs
+    """
+    temp_crs = data.crs.copy()
+    column_names = data.columns
+    column_dtypes = data.dtypes
+    all_vals = np.empty((0, len(column_names)))
+    all_points = []
+    all_counts = []
+    all_ids = []
+
+    for i, row in data.iterrows():
+        temp_points = line_to_equi_points(row['geometry'], equi_dist)
+        all_points.extend(temp_points)
+        all_counts.extend([len(temp_points)]*len(temp_points))
+        all_vals = np.append(all_vals, np.array([row.values]*len(temp_points)),axis =0)
+        all_ids.extend([i]*len(temp_points))
+        
+    data_out = gpd.GeoDataFrame(all_vals, columns= column_names,
+                                geometry = gpd.GeoSeries(all_points))
+    
+    data_out = data_out.astype(column_dtypes)
+    
+    if return_counts:
+        data_out['COUNTS'] = all_counts
+    
+    if add_line_id:
+        data_out['ID'] = all_ids
+    
+    data_out.crs = temp_crs 
+    return data_out
