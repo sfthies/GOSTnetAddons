@@ -3,12 +3,14 @@ import numpy as np
 import geopandas as gpd
 import GOSTnets as gn
 import pandas as pd
-from shapely.geometry import LineString, Point, MultiPoint, MultiLineString
+from shapely.geometry import LineString, Point, MultiPoint, MultiLineString, box
 import mapclassify
 from shapely.ops import cascaded_union, polygonize
 from scipy.spatial import Delaunay
 import fiona
-
+import time
+import rasterio
+import os
     
 def make_fishnet(gpd_df, res, reduced = True):
     """
@@ -634,8 +636,8 @@ def replace_mode_in_network(G, mode):
         count_n = count_n + 1
     
     
-    print(count_e, 'mode attributes of edges were replaces and set to', mode)
-    print(count_n, 'mode attributes of nodes were replaces and set to', mode)
+    print(count_e, 'mode attributes of edges were replaced and set to', mode)
+    print(count_n, 'mode attributes of nodes were replaced and set to', mode)
         
         
     return(G_temp)    
@@ -952,3 +954,54 @@ def linegdf_to_pointgdf(data, equi_dist, return_counts = True, add_line_id = Fal
     
     data_out.crs = temp_crs 
     return data_out
+
+def sample_raster_line_gdf(input_dat, tif_path, property_name = 'RasterValue', equi_dist = 100, raster_crs = {'init': 'epsg:4326'}, trace = False):
+    """
+    Attaches raster values to a gpd SpatialLines data frame.
+    ------
+    Parameters:
+    input_dat <GeoPandas.GeoDataFrame>: Input data with spatial line geometries
+    tif_path <string>: Location of the raster to sample from
+    property_name <string>: Name for the new column added to input dat and containing the raster values
+    equi_dist <float>: distance indicating in which spacing the line data is resampled (ideally equi_dist<resolution of the raster)
+    """
+    time_0 = time.time()
+    #Open raster
+    raster_dat = rasterio.open(os.path.join(tif_path))
+    b = raster_dat.bounds
+    datasetBoundary = box(b[0], b[1], b[2], b[3])
+    
+    time_1 = time.time() 
+    if trace:
+        print("Open raster:               --- %s seconds ---" % (time_1- time_0))
+    
+    # Transform edge data to points and into crs of the raster:
+    input_index = input_dat.index
+    output_dat = input_dat.reset_index(drop = True)
+    temp_point_dat = linegdf_to_pointgdf(output_dat, equi_dist, add_line_id= True).to_crs(raster_crs)
+    
+    time_2 = time.time() 
+    if trace:
+        print("Transfrom lines to points: --- %s seconds ---" % (time_2- time_1))
+    
+    #Decide which points lie within the raster, then sample
+    selector = [x.intersects(datasetBoundary) for x in temp_point_dat.geometry]
+    selected_coords = [(point.x, point.y) for point in temp_point_dat.loc[selector, 'geometry']]
+    raster_values = [x[0] for x in list(raster_dat.sample(selected_coords))]
+    
+    time_3 = time.time()
+    if trace:
+        print("Attach raster values:      --- %s seconds ---" % (time_3- time_2))
+        
+    temp_point_dat[property_name] = np.nan
+    temp_point_dat.loc[selector, property_name] = raster_values
+    output_dat.loc[:,property_name] = temp_point_dat.groupby('ID')[property_name].max().reset_index(drop = True)
+    
+    output_dat.index = input_index
+    time_4 = time.time()
+    if trace:
+        print("Reaggregated and return:   --- %s seconds ---" % (time_4- time_3))
+    
+    print("Time total:                --- %s seconds ---" % (time_4- time_0))
+    
+    return output_dat
