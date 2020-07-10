@@ -787,7 +787,7 @@ def combine_networks(base, new, walk_speed = 4.5, walk_thres = 100, add_boarding
         data = {}
         data['length'] = row['NN_dist']
         data['infra_type'] = 'net_glue'
-        data['mode'] = 'net_glue (walk)'
+        data['mode'] = 'net_glue'
         data['time'] = row['NN_dist']/(walk_speed*1000/3600)
         #data['Wkt'] = LineString([row.geometry, gdf_base.geometry.loc[v]])
         if data['length']< walk_thres:
@@ -798,7 +798,8 @@ def combine_networks(base, new, walk_speed = 4.5, walk_thres = 100, add_boarding
             data2 = {}
             data2['length'] = row['NN_dist']
             data2['infra_type'] = 'net_glue'
-            data2['mode'] = 'net_glue (walk)'
+            data2['mode'] = 'net_glue_to'  
+            data2['to_mode'] = str(new_net.nodes[row['node_ID']]['mode'])
             data2['boarding_c'] = row['boarding_c']
             data2['boarding_w'] = row['NN_dist']/(walk_speed*1000/3600)
             data2['time'] = data2['boarding_c'] + data2['boarding_w']
@@ -1005,3 +1006,93 @@ def sample_raster_line_gdf(input_dat, tif_path, property_name = 'RasterValue', e
     print("Time total:                --- %s seconds ---" % (time_4- time_0))
     
     return output_dat
+
+
+def sample_raster_edges(G, tif_path, agg_fun = 'max', property_name = 'RasterValue', equi_dist = 100, raster_crs = {'init': 'epsg:4326'}, trace = False):
+    """
+    Attaches raster values to the edges of a graph. 
+    ------
+    Parameters:
+    G <networkx.graph>: Input graph
+    tif_path <string>: Location of the raster to sample from
+    agg_fun: function to aggregate values along each edge
+    property_name <string>: Name for the attribute added to the graph
+    equi_dist <float>: distance indicating in which spacing the line data is resampled (ideally equi_dist<resolution of the raster)
+    raster_crs: crs of the raster file - important for projections & correct sampling
+    """ 
+    time_0 = time.time()
+    #Open raster
+    raster_dat = rasterio.open(os.path.join(tif_path))
+    b = raster_dat.bounds
+    datasetBoundary = box(b[0], b[1], b[2], b[3])
+    
+    time_1 = time.time() 
+    if trace:
+        print("Open raster:               --- %s seconds ---" % round(time_1- time_0))
+    
+    # Prepare sampling of graph data:
+    G_temp = G.copy()
+    crs_temp = G_temp.graph['crs']
+    
+    points_to_sample = {}
+    
+    for u,v,w, geom in G_temp.edges(keys = True, data = 'geometry'):
+        if geom == None:
+            temp_line = LineString(np.array([[G.nodes(data = 'x')[u], G.nodes(data = 'y')[u]],
+                                 [G.nodes(data = 'x')[v], G.nodes(data = 'y')[v]]]))
+            temp_points = line_to_equi_points(temp_line,equi_dist)
+
+            points_to_sample.update({(u,v,w): temp_points})
+
+        else:
+            temp_points = line_to_equi_points(geom, equi_dist)        
+            points_to_sample.update({(u,v,w): temp_points})
+
+    time_2 = time.time() 
+    if trace:
+        print("Preparation & interpolation of sampling points: --- %s seconds ---" % round(time_2- time_1))
+    
+    #Project point coordinates and check which ones lie within raster
+    # Bring the list of all points into a geopandas fromat
+    gpS = gpd.GeoSeries(pd.Series(points_to_sample).explode(), crs = crs_temp)
+
+    gpS = gpS.to_crs(raster_crs)
+
+    #Check which points lie within the raster
+    selector = [x.intersects(datasetBoundary) for x in gpS]
+    #subset to those
+    gpS_query = gpS[selector]
+    #obtain coords for query
+    query_points = gpS_query.apply(lambda x: (x.x,x.y))
+    
+    time_3 = time.time()
+    if trace:
+        print("Projecting and preparing query points:      --- %s seconds ---" % round(time_3- time_2))
+    
+    #Do the query
+    sample_values = pd.Series([x[0] for x in list(raster_dat.sample(query_points.values))], index =  gpS_query.index)
+    time_4 = time.time()
+    if trace:
+        print("Raster query:      --- %s seconds ---" % round(time_4- time_3))
+    
+    
+    #Set empty data set with correcrt property name and missing values:
+    new_dat = pd.DataFrame(pd.Series(np.nan, index = gpS.index), columns = [property_name])
+    #Replace all missing values with sampled values (if points were within raster)
+    new_dat[property_name] = sample_values
+
+    #Calculate max per unique index
+    new_edge_dat = new_dat.groupby(level=[0,1,2]).agg(agg_fun)
+
+    nx.set_edge_attributes(G_temp, new_edge_dat.to_dict()[property_name],name = property_name)
+    
+  
+    
+    time_5 = time.time()
+    if trace:
+        print("Aggregation per edge and adding info to graph:      --- %s seconds ---" % round(time_5- time_4))
+    
+    if trace:
+        print("Time total:                --- %s seconds ---" % round(time_5- time_0))
+  
+    return G_temp
